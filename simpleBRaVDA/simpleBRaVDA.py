@@ -170,6 +170,7 @@ class Settings:
     alpha: float = 0.15
     radial_step: object = None
     acceleration_scale: object = None
+    reference_radius: object = None
     outer_radius: object = None
     gtol: float = 1e-5
     maxiter: int = 1000
@@ -320,22 +321,31 @@ class AssimilationProblem:
     start_mjd: float
     end_mjd: float
     forecast_time: Time
+    r_ref: float = 30 * u.solRad.to(u.km)  # residual-acceleration reference radius
+
+    def acceleration(self):
+        """Per-step residual-acceleration increment per unit boundary speed.
+
+        Matches the HUXt/SURF profile v(r) = v0 (1 + alpha (1 - exp(-(r - r_ref)/r_h)))
+        with r_ref = 30 solar radii (Settings.reference_radius), anchored so that
+        v equals the boundary speed at the inner radius. Step i -> i + 1 adds
+        ``acceleration()[i] * boundary``; summed to radius r_k this gives
+        v(r_k) / v(r_inner) = f(r_k) / f(r_inner), with f the bracket above.
+        """
+        alpha = self.settings.alpha
+        decay = np.exp(-(self.radius - self.r_ref) / self.r_h)
+        return alpha * (decay[:-1] - decay[1:]) / (1 + alpha * (1 - decay[0]))
 
     def forward(self, boundary):
         n = len(boundary)
         field = np.empty((len(self.radius), n))
         field[0] = boundary
         c = self.dr * OMEGA / (2 * np.pi / n)
-        alpha = self.settings.alpha
-        for i, r in enumerate(self.radius[:-1]):
+        acceleration = self.acceleration()
+        for i in range(len(self.radius) - 1):
             v = field[i]
             transport = c * (np.roll(v, -1) - v) / v
-            if i == 0:
-                field[i + 1] = v + transport + alpha * boundary * (1 - np.exp(-r / self.r_h))
-            else:
-                a1 = alpha * boundary * (1 - np.exp(-(r - self.dr) / self.r_h))
-                a2 = alpha * boundary * (1 - np.exp(-r / self.r_h))
-                field[i + 1] = v + transport - a1 + a2
+            field[i + 1] = v + transport + acceleration[i] * boundary
         return field
 
     def objective(self):
@@ -348,6 +358,7 @@ class AssimilationProblem:
         cached_x, cached_value = None, None
         n = len(self.prior)
         c = self.dr * OMEGA / (2 * np.pi / n)
+        acceleration = self.acceleration()
 
         def evaluate(x):
             nonlocal cached_x, cached_value
@@ -366,11 +377,8 @@ class AssimilationProblem:
             adj = forcing[-1].copy()
             boundary_terms = np.zeros(n)
             for i in range(len(field) - 2, -1, -1):
-                r, v = self.radius[i], field[i]
-                a = self.settings.alpha * (1 - np.exp(-r / self.r_h))
-                if i:
-                    a -= self.settings.alpha * (1 - np.exp(-(r - self.dr) / self.r_h))
-                boundary_terms += a * adj
+                v = field[i]
+                boundary_terms += acceleration[i] * adj
                 diagonal = 1 - c * (np.roll(v, -1) / (v * v))
                 neighbour = c * (1 / np.roll(v, 1))
                 adj = diagonal * adj + neighbour * np.roll(adj, 1)
@@ -408,9 +416,10 @@ def prepare_problem(forecast_time, observations, speed_map, longitude, latitude,
     rs = u.solRad.to(u.km)
     dr = rs if settings.radial_step is None else float(_values(settings.radial_step, u.AU) * u.AU.to(u.km))
     r_h = 50 * rs if settings.acceleration_scale is None else float(_values(settings.acceleration_scale, u.AU) * u.AU.to(u.km))
+    r_ref = 30 * rs if settings.reference_radius is None else float(_values(settings.reference_radius, u.AU) * u.AU.to(u.km))
     outer = 240 * rs if settings.outer_radius is None else float(_values(settings.outer_radius, u.AU) * u.AU.to(u.km))
     inner = float(_values(inner_radius, u.AU) * u.AU.to(u.km))
-    if not all(np.isfinite([inner, outer, dr, r_h])) or not (0 < inner < outer and dr > 0 and r_h > 0):
+    if not all(np.isfinite([inner, outer, dr, r_h, r_ref])) or not (0 < inner < outer and dr > 0 and r_h > 0):
         raise ValueError('Require 0 < inner_radius < outer_radius and positive radial scales.')
     radius = np.arange(inner, outer, dr)
     if len(radius) < 2:
@@ -443,7 +452,7 @@ def prepare_problem(forecast_time, observations, speed_map, longitude, latitude,
         covariance *= np.exp(-distance**2 / (2 * settings.localisation_deg**2))
     problem = AssimilationProblem(rotated[0].copy(), covariance, ensemble.copy(),
                                   radius, dr, r_h, settings, [], (grid + phase) % (2 * np.pi),
-                                  centres[::-1], start, end, end_time)
+                                  centres[::-1], start, end, end_time, r_ref)
     streams = [observations] if isinstance(observations, SolarWindSeries) else list(observations)
     if not streams or not all(isinstance(s, SolarWindSeries) for s in streams):
         raise ValueError('Supply one SolarWindSeries or a nonempty list of them.')

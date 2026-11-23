@@ -9,6 +9,8 @@ import surf.surf_insitu as sinsit
 FORECAST_DATE = "2019-03-1"  # UTC; change only this line
 PLOT_INSITU_SURF = True
 PLOT_BRAVDA_SURF = True
+PLOT_WSA_SURF = True
+SOLVER_LINESTYLES = {"hydro": "-", "huxt": "--"}  # remove a solver to hide it
 
 issue = pd.Timestamp(FORECAST_DATE)
 sources = [
@@ -16,29 +18,42 @@ sources = [
         PLOT_INSITU_SURF,
         "InSitu-SURF",
         Path("insitusurf_forecasts") / f"{issue:%Y}" / f"insitusurf_{issue:%Y%m%dT0000Z}.csv",
-        "C0",
-        "-",
+        "blue",
     ),
     (
         PLOT_BRAVDA_SURF,
         "WSA-BRaVDA-SURF",
         Path("wsa_bravda_surf_forecasts") / f"{issue:%Y}"
         / f"wsa_bravda_surf_{issue:%Y%m%dT0000Z}.csv",
-        "C3",
-        "--",
+        "red",
+    ),
+    (
+        PLOT_WSA_SURF,
+        "WSA-SURF",
+        Path("wsa_surf_forecasts") / f"{issue:%Y}" / f"wsa_surf_{issue:%Y%m%dT0000Z}.csv",
+        "green",
     ),
 ]
 
 forecasts = []
-for enabled, label, path, color, linestyle in sources:
+for enabled, label, path, color in sources:
     if not enabled:
         continue
     if not path.exists():
         print(f"Skipping unavailable {label} forecast: {path}")
         continue
-    forecasts.append(
-        (label, pd.read_csv(path, comment="#", parse_dates=["time"]), color, linestyle)
-    )
+    frame = pd.read_csv(path, comment="#", parse_dates=["time"])
+    for solver, linestyle in SOLVER_LINESTYLES.items():
+        if f"vsw_{solver}" not in frame:
+            print(f"{path.name} has no {solver} run; rerun the generator")
+            continue
+        columns = {f"{name}_{solver}": name for name in ("vsw", "n", "T", "bpol")}
+        forecasts.append((
+            f"{label} ({solver})",
+            frame[["time", *[c for c in columns if c in frame]]].rename(columns=columns),
+            color,
+            linestyle,
+        ))
 
 if not forecasts:
     raise FileNotFoundError(f"No enabled forecast is available for {issue:%Y-%m-%d}")

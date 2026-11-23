@@ -17,6 +17,7 @@ import generate_wsa_bravda_surf_forecasts as bravda_run
 
 FORECAST_DATE = "2023-09-15"  # UTC; change only this line
 FORECAST_DAYS = 27
+SOLVER = "hydro"  # the inflation comparison below is for the hydro solver
 
 
 def main():
@@ -37,7 +38,7 @@ def main():
         nlon=insitu_run.NLON,
         v_max=insitu_run.V_MAX,
         dt_scale=insitu_run.DT_SCALE,
-        solver=insitu_run.SOLVER,
+        solver=SOLVER,
         gamma=insitu_run.GAMMA,
         run_2d=False,
         track_cmes=False,
@@ -104,7 +105,7 @@ def main():
         simtime=simulation_time,
         lon_out=0 * u.rad,
         dt_scale=bravda_run.DT_SCALE,
-        solver=bravda_run.SOLVER,
+        solver=SOLVER,
         gamma=bravda_run.GAMMA,
         track_cmes=False,
         parallel=False,
@@ -122,7 +123,7 @@ def main():
         simtime=simulation_time,
         lon_out=0 * u.rad,
         dt_scale=bravda_run.DT_SCALE,
-        solver=bravda_run.SOLVER,
+        solver=SOLVER,
         gamma=bravda_run.GAMMA,
         track_cmes=False,
         parallel=False,
