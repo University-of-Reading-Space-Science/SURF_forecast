@@ -1,6 +1,7 @@
 # WSA + simpleBRaVDA + SURF deterministic forecast Earth time series
 # solvers: huxt, hydro
 # wsa_selection: newest map at or before the issue time
+# omni_donki_require_linked_cme: True
 # columns: shared time/position columns, then solver-suffixed outputs (e.g. vsw_huxt, vsw_hydro)
 # forecast_issue_time_utc: 2019-12-20T00:00:00Z
 # forecast_end_time_utc: 2019-12-30T00:00:00Z

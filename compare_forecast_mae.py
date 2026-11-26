@@ -1,11 +1,12 @@
-"""Compare InSitu-SURF and WSA-BRaVDA-SURF speed forecast MAE against OMNI.
-
-Also compares the standard WSA-BRaVDA-SURF runs with WSA(-3d)-BRaVDA-SURF,
-which uses WSA maps from 3 days before the issue time (map-age sensitivity).
+"""Compare InSitu-SURF (with and without DONKI cone CMEs), WSA-BRaVDA-SURF and
+WSA-SURF speed forecast MAE against OMNI.
 
 Each forecast CSV holds a HUXt and a hydro run (vsw_huxt, vsw_hydro); each
 solver is evaluated as a separate forecast system. Files written by earlier
 versions of the generators (single solver, or nearest-time WSA) are ignored.
+
+High-speed streams are also verified as events: hits, misses and false alarms
+by lead day, with arrival-time and peak-speed errors for the hits.
 """
 
 from pathlib import Path
@@ -16,35 +17,48 @@ import numpy as np
 import pandas as pd
 import surf.surf_insitu as sinsit
 
-from generate_insitusurf_forecasts import required_header as insitu_header, stored_header
+from generate_insitusurf_forecasts import (
+    OMNI_LOOKBACK, prepare_omni, required_header as insitu_header, stored_header,
+)
+from generate_insitu_cone_surf_forecasts import required_header as cone_header
 from generate_wsa_bravda_surf_forecasts import required_header as bravda_header
 from generate_wsa_surf_forecasts import required_header as wsa_header
-from generate_wsaminus3_bravda_surf_forecasts import (
-    required_header as wsaminus3_bravda_header,
-)
 
 
 # ---------------------------------------------------------------------------
 # User settings
 # ---------------------------------------------------------------------------
 # Use None for both dates to evaluate every available forecast.
-START_DATE = None                 # e.g. "2020-01-01"
-END_DATE = None                   # e.g. "2020-12-31" (inclusive)
+START_DATE = None #"2020-06-01"#                # e.g. "2020-01-01"
+END_DATE = None  #"2025-07-01"#                 # e.g. "2020-12-31" (inclusive)
 LEAD_DAYS = range(1, 11)          # day 1 is lead time [0, 24) hours
 
 USE_INSITU_SURF = True
+USE_INSITU_CONE_SURF = True
 USE_BRAVDA_SURF = True
 USE_WSA_SURF = True
-USE_WSAMINUS3_BRAVDA_SURF = True
 USE_27_DAY_RECURRENCE = True
 REQUIRE_COMMON_FORECAST_DATES = True
 RECURRENCE_DAYS = 27.2753
 DISTRIBUTION_LEAD_DAY = 4
 YEARLY_LEAD_DAY = 4              # lead day for the MAE-by-year figure
 MIN_FORECASTS_PER_YEAR = 30       # years with fewer issue dates are dropped
-MAP_AGE_SCATTER_LEAD_DAY = 4     # lead day for the per-forecast MAE scatter
 
-SOLVERS = ("hydro", "huxt")         # evaluated separately; drop one to skip it
+# High-speed stream (HSS) event verification by lead day, following
+# HUXt_insitu/code/hse.py (Owens et al., 2005). Observed events come from
+# OMNI with no ICME removal.
+USE_HSS_ANALYSIS = True
+# Repeat the HSS analysis against OMNI with DONKI ICMEs removed (the same
+# cleaning the InSitu-SURF and BRaVDA inputs use). MAE always uses raw OMNI.
+HSS_ALSO_ICME_REMOVED = True
+HSS_SMOOTHING_HOURS = 8           # running mean applied before detection
+HSS_RISE_THRESHOLD = 100          # km/s rise needed to flag an event...
+HSS_RISE_HOURS = 48               # ...within this many hours
+HSS_MIN_SEPARATION_HOURS = 24     # closer events are merged
+HSS_MATCH_WINDOW_HOURS = 72       # max-gradient-time matching tolerance
+HSS_TIMING = "max_gradient"              # timing error from 'start', 'peak' or 'max_gradient'
+
+SOLVERS = ("hydro",)        # evaluated separately; drop one to skip it (keep the comma)
 
 # name: (directory, file pattern, enabled, colour, required header lines)
 SOURCES = {
@@ -55,19 +69,19 @@ SOURCES = {
         "blue",
         set(insitu_header()),
     ),
+    "InSitu-Cone-SURF": (
+        Path("insitu_cone_surf"),
+        "insitu_cone_surf_*.csv",
+        USE_INSITU_CONE_SURF,
+        "purple",
+        set(cone_header()),
+    ),
     "WSA-BRaVDA-SURF": (
         Path("wsa_bravda_surf_forecasts"),
         "wsa_bravda_surf_*.csv",
         USE_BRAVDA_SURF,
         "red",
         set(bravda_header()),
-    ),
-    "WSA(-3d)-BRaVDA-SURF": (
-        Path("wsaminus3_bravda_surf_forecasts"),
-        "wsaminus3_bravda_surf_*.csv",
-        USE_WSAMINUS3_BRAVDA_SURF,
-        "darkorange",
-        set(wsaminus3_bravda_header()),
     ),
     "WSA-SURF": (
         Path("wsa_surf_forecasts"),
@@ -80,7 +94,6 @@ SOURCES = {
 SOLVER_LINESTYLES = {"hydro": "-", "huxt": "--"}
 SOLVER_MARKERS = {"hydro": "o", "huxt": "^"}
 BRAVDA = "WSA-BRaVDA-SURF"
-LAGGED_BRAVDA = "WSA(-3d)-BRaVDA-SURF"
 RECURRENCE = "27.27-day recurrence"
 plt.rcParams.update({"font.size": 14, "legend.fontsize": 12})
 
@@ -191,20 +204,48 @@ def main():
                 for value in absolute_error[in_lead_day].to_numpy()
             )
 
+    # Fixed-lead-day forecast series on the OMNI time grid, for the stream
+    # analysis: row lead_day - 1 holds that lead day of every forecast, joined
+    # end to end.
+    hourly = omni.drop_duplicates("datetime").set_index("datetime")["V"]
+    grid = pd.date_range(hourly.index[0], hourly.index[-1],
+                         freq=hourly.index.to_series().diff().median())
+    observed_speed = hourly.reindex(grid).to_numpy()
+    grid_ns = nanoseconds(grid)
+    step_ns = grid_ns[1] - grid_ns[0]
+    day_ns = 86_400 * 10**9
+    stitched = {}
+
+    def stitch(model_name, issue, time_ns, speed):
+        """Add one forecast to the fixed-lead-day series of its model."""
+        series = stitched.setdefault(
+            model_name, np.full((max_lead, len(grid)), np.nan)
+        )
+        issue_ns = issue.as_unit("ns").value
+        first, stop = np.searchsorted(
+            grid_ns, [issue_ns, issue_ns + max_lead * day_ns]
+        )
+        sample_ns = grid_ns[first:stop]
+        covered = (
+            (sample_ns >= time_ns[0] - step_ns) & (sample_ns <= time_ns[-1] + step_ns)
+        )
+        series[
+            (sample_ns[covered] - issue_ns) // day_ns,
+            np.arange(first, stop)[covered],
+        ] = np.interp(sample_ns[covered], time_ns, speed)
+
     valid_omni = omni.loc[omni["V"].notna()]
-    bravda_frames = {}  # (source, issue) -> forecast speeds, for map-age plots
     for source_name, files in available.items():
         print(f"Evaluating {len(files)} {source_name} forecasts")
         for issue, path in sorted(files.items()):
             frame = pd.read_csv(path, comment="#", parse_dates=["time"])
-            if source_name in (BRAVDA, LAGGED_BRAVDA):
-                bravda_frames[(source_name, issue)] = frame[
-                    ["time", *(f"vsw_{solver}" for solver in SOLVERS)]
-                ]
             for solver in SOLVERS:
                 forecast = frame[["time", f"vsw_{solver}"]].dropna().sort_values("time")
                 if forecast.empty:
                     continue
+                stitch(model_label(source_name, solver), issue,
+                       nanoseconds(forecast["time"]),
+                       forecast[f"vsw_{solver}"].to_numpy())
                 verification = valid_omni.loc[
                     (valid_omni["datetime"] >= forecast["time"].min())
                     & (valid_omni["datetime"] <= forecast["time"].max())
@@ -225,8 +266,12 @@ def main():
         source_time = nanoseconds(valid_omni["datetime"])
         source_speed = valid_omni["V"].to_numpy()
         recurrence = pd.Timedelta(days=RECURRENCE_DAYS)
+        recurrence_speed = np.interp(
+            grid_ns - recurrence.as_unit("ns").value, source_time, source_speed
+        )
 
         for issue in all_dates:
+            stitch(RECURRENCE, issue, grid_ns, recurrence_speed)
             verification = valid_omni.loc[
                 (valid_omni["datetime"] >= issue)
                 & (valid_omni["datetime"] < issue + pd.Timedelta(days=max_lead))
@@ -385,14 +430,6 @@ def main():
                     linestyle=SOLVER_LINESTYLES[solver], color="purple",
                     label=f"InSitu-SURF − WSA-BRaVDA-SURF ({solver})",
                 )
-            lagged = model_label(LAGGED_BRAVDA, solver)
-            if lagged in mae_table and bravda in mae_table:
-                difference = (mae_table[lagged] - mae_table[bravda]).dropna()
-                diff_axis.plot(
-                    difference.index, difference, marker="o",
-                    linestyle=SOLVER_LINESTYLES[solver], color="darkorange",
-                    label=f"WSA(-3d) − WSA-BRaVDA-SURF ({solver})",
-                )
         diff_axis.axhline(0, color="black", linewidth=1)
         diff_axis.set(
             xlabel="Forecast issue year",
@@ -407,151 +444,182 @@ def main():
     else:
         print(f"No lead day {YEARLY_LEAD_DAY} samples; add it to LEAD_DAYS")
 
-    plot_map_age_comparison(samples, bravda_frames)
+    if USE_HSS_ANALYSIS:
+        print("\nHSS verification against OMNI (no ICME removal)")
+        high_speed_stream_analysis(grid, observed_speed, stitched,
+                                   "Observed: OMNI (no ICME removal)")
+        if HSS_ALSO_ICME_REMOVED:
+            # prepare_omni downloads from first_forecast - OMNI_LOOKBACK.
+            cleaned = prepare_omni((grid[0] + OMNI_LOOKBACK).to_pydatetime(),
+                                   grid[-1].to_pydatetime())
+            cleaned_speed = (
+                cleaned.drop_duplicates("datetime").set_index("datetime")["V"]
+                .reindex(grid).to_numpy(copy=True)
+            )
+            # Keep raw OMNI data gaps as gaps; cleaning fills them by interpolation.
+            cleaned_speed[~np.isfinite(observed_speed)] = np.nan
+            print("\nHSS verification against OMNI with DONKI ICMEs removed")
+            high_speed_stream_analysis(grid, cleaned_speed, stitched,
+                                       "Observed: OMNI with DONKI ICMEs removed")
     plt.show()
 
 
-def plot_map_age_comparison(samples, bravda_frames):
-    """Compare WSA-BRaVDA-SURF using the newest WSA map with the 3-day-old map.
+def detect_hss_events(times, speed):
+    """High-speed-stream events in an hourly speed series (after hse.py).
 
-    The two systems are paired by issue time, so every panel uses only
-    forecasts present for both. Panels: (a) MAE by lead day; (b) paired MAE
-    difference (lagged - standard; positive means the newest map is better)
-    with +/-2 standard errors; (c) per-forecast MAE at MAP_AGE_SCATTER_LEAD_DAY;
-    (d) how far the two forecasts differ from each other, independent of OMNI.
+    The series is smoothed over HSS_SMOOTHING_HOURS. An event is flagged where
+    the speed rises by at least HSS_RISE_THRESHOLD within HSS_RISE_HOURS. It
+    starts at the minimum in that window and ends when the speed stops rising;
+    the peak is the maximum in between. Events separated by less than
+    HSS_MIN_SEPARATION_HOURS are merged.
+
+    Returns a DataFrame of events: start, end, peak and max_gradient times,
+    and peak_speed.
     """
-    present = set(samples["model"])
-    solvers = [
-        solver for solver in SOLVERS
-        if {model_label(BRAVDA, solver), model_label(LAGGED_BRAVDA, solver)} <= present
-    ]
-    if not solvers:
-        print(f"Map-age comparison skipped: need both {BRAVDA} and {LAGGED_BRAVDA}")
-        return
-
-    # Mean absolute error per forecast and lead day, so the systems pair by issue.
-    per_issue = (
-        samples.groupby(["model", "issue_time", "lead_day"])["absolute_error_km_s"]
-        .mean().rename("mae").reset_index()
+    dt_hours = (times[1] - times[0]) / pd.Timedelta(hours=1)
+    v = (
+        pd.Series(speed)
+        .rolling(max(1, round(HSS_SMOOTHING_HOURS / dt_hours)), center=True, min_periods=1)
+        .mean().to_numpy()
     )
-    figure, axes = plt.subplots(2, 2, figsize=(16, 11))
-    mae_axis, diff_axis, scatter_axis, spread_axis = axes.ravel()
-    paired_issues = set()
+    step = round(HSS_RISE_HOURS / dt_hours)
 
-    for solver in solvers:
-        standard = model_label(BRAVDA, solver)
-        lagged = model_label(LAGGED_BRAVDA, solver)
-        paired = per_issue.loc[per_issue["model"] == standard].merge(
-            per_issue.loc[per_issue["model"] == lagged],
-            on=["issue_time", "lead_day"], suffixes=("_standard", "_lagged"),
-        )
-        if paired.empty:
-            continue
-        paired_issues |= set(paired["issue_time"])
-        linestyle = SOLVER_LINESTYLES[solver]
-        n_issues = paired["issue_time"].nunique()
+    def max_gradient(start, end):
+        gradients = np.diff(v[start:end + 1])
+        if not np.isfinite(gradients).any():
+            return start
+        return start + int(np.nanargmax(gradients))
 
-        by_lead = paired.groupby("lead_day")
-        for column, name in (("mae_standard", standard), ("mae_lagged", lagged)):
-            color, _ = series_style(name)
-            means = by_lead[column].mean()
-            mae_axis.plot(means.index, means, marker="o", linestyle=linestyle,
-                          color=color, label=name)
+    events = []  # [start, end, peak, max_gradient] sample indices
+    i = 0
+    while i < len(v) - step:
+        if v[i + step] - v[i] >= HSS_RISE_THRESHOLD:
+            start = i + int(np.nanargmin(v[i:i + step + 1]))
+            end = i + step
+            while end + 1 < len(v) and v[end + 1] >= v[end]:
+                end += 1
+            peak = start + int(np.nanargmax(v[start:end + 1]))
+            events.append([start, end, peak, max_gradient(start, peak)])
+            i = end + 1
+        else:
+            i += 1
 
-        # Daily forecasts overlap in time, so these error bars are optimistic.
-        paired["delta"] = paired["mae_lagged"] - paired["mae_standard"]
-        stats = paired.groupby("lead_day")["delta"].agg(["mean", "sem"])
-        diff_axis.errorbar(
-            stats.index, stats["mean"], yerr=2 * stats["sem"], marker="o",
-            linestyle=linestyle, color="darkorange", capsize=3,
-            label=f"{solver} (n={n_issues} forecasts)",
-        )
+    merged = []
+    for event in events:
+        if merged and (event[0] - merged[-1][1]) * dt_hours < HSS_MIN_SEPARATION_HOURS:
+            start, end = merged[-1][0], event[1]
+            peak = start + int(np.nanargmax(v[start:end + 1]))
+            merged[-1] = [start, end, peak, max_gradient(start, end)]
+        else:
+            merged.append(event)
 
-        day = paired.loc[paired["lead_day"] == MAP_AGE_SCATTER_LEAD_DAY]
-        if not day.empty:
-            standard_better = np.mean(day["mae_standard"] < day["mae_lagged"])
-            scatter_axis.scatter(
-                day["mae_standard"], day["mae_lagged"], s=10, alpha=0.35,
-                marker=SOLVER_MARKERS[solver],
-                color="red" if solver == "hydro" else "darkorange",
-                label=f"{solver}: newest map better in {standard_better:.0%}",
-            )
+    columns = ["start", "end", "peak", "max_gradient"]
+    indices = np.array(merged, dtype=int).reshape(-1, 4)
+    result = pd.DataFrame({name: times[indices[:, k]] for k, name in enumerate(columns)})
+    result["peak_speed"] = v[indices[:, 2]]
+    return result
 
-    # Recurrence MAE over the same issue dates, for reference.
-    recurrence = per_issue.loc[
-        (per_issue["model"] == RECURRENCE) & per_issue["issue_time"].isin(paired_issues)
-    ]
-    if not recurrence.empty:
-        means = recurrence.groupby("lead_day")["mae"].mean()
-        mae_axis.plot(means.index, means, color="black", linestyle=":",
-                      label=RECURRENCE)
-    mae_axis.set(xlabel="Forecast lead day", ylabel="Speed MAE [km/s]",
-                 xticks=list(LEAD_DAYS), title="(a) MAE on paired issue dates")
-    mae_axis.grid(alpha=0.25)
-    mae_axis.legend(fontsize=10)
 
-    diff_axis.axhline(0, color="black", linewidth=1)
-    diff_axis.set(xlabel="Forecast lead day",
-                  ylabel="MAE(WSA −3 d) − MAE(newest WSA) [km/s]",
-                  xticks=list(LEAD_DAYS),
-                  title="(b) Paired MAE difference (±2 SE)")
-    diff_axis.grid(alpha=0.25)
-    diff_axis.legend(fontsize=10)
+def match_hss_events(observed, forecast):
+    """One-to-one matching of events by max-gradient time (after hse.py).
 
-    if scatter_axis.collections:
-        limits = [*scatter_axis.get_xlim(), *scatter_axis.get_ylim()]
-        lower, upper = max(0, min(limits)), max(limits)
-        scatter_axis.plot([lower, upper], [lower, upper], color="black", linewidth=1)
-        scatter_axis.set(xlim=(lower, upper), ylim=(lower, upper), aspect="equal")
-        scatter_axis.legend(fontsize=10, markerscale=2)
-    scatter_axis.set(xlabel=f"{BRAVDA} MAE [km/s]",
-                     ylabel=f"{LAGGED_BRAVDA} MAE [km/s]",
-                     title=f"(c) Per-forecast MAE, lead day {MAP_AGE_SCATTER_LEAD_DAY}")
-    scatter_axis.grid(alpha=0.25)
-
-    # Divergence of the two forecasts from each other on the model time grid.
-    common = sorted(
-        {issue for source, issue in bravda_frames if source == BRAVDA}
-        & {issue for source, issue in bravda_frames if source == LAGGED_BRAVDA}
+    Each observed event takes the nearest forecast event within
+    HSS_MATCH_WINDOW_HOURS; conflicts go to the closest pair. Returns
+    (observed index, forecast index) pairs.
+    """
+    if observed.empty or forecast.empty:
+        return []
+    separation = np.abs(
+        (observed["max_gradient"].to_numpy()[:, None]
+         - forecast["max_gradient"].to_numpy()[None, :]) / pd.Timedelta(hours=1)
     )
+    candidates = []
+    for i, row in enumerate(separation):
+        j = int(np.argmin(row))
+        if row[j] <= HSS_MATCH_WINDOW_HOURS:
+            candidates.append((row[j], i, j))
+    pairs, used = [], set()
+    for _, i, j in sorted(candidates):
+        if j not in used:
+            used.add(j)
+            pairs.append((i, j))
+    return pairs
+
+
+def high_speed_stream_analysis(grid, observed_speed, stitched, title=None):
+    """Event-based verification of high-speed streams, by forecast lead day.
+
+    ``stitched[model][lead_day - 1]`` is the forecast speed on ``grid`` taken
+    from that lead day of every forecast: the series a user of that lead time
+    would have seen. Observed and forecast events are found only over the
+    samples where both series exist. Matched events are hits, unmatched
+    observed events misses and unmatched forecast events false alarms.
+    Timing errors use HSS_TIMING ('start', 'peak' or 'max_gradient').
+    """
+    def ratio(count, total):
+        return count / total if total else np.nan
+
     rows = []
-    for issue in common:
-        merged = bravda_frames[(BRAVDA, issue)].merge(
-            bravda_frames[(LAGGED_BRAVDA, issue)], on="time",
-            suffixes=("_standard", "_lagged"),
-        )
-        lead_day = ((merged["time"] - issue).dt.total_seconds() // 86400).astype(int) + 1
-        for solver in solvers:
-            rows.append(pd.DataFrame({
-                "solver": solver,
+    for model_name, series in stitched.items():
+        for lead_day in LEAD_DAYS:
+            forecast_speed = series[lead_day - 1]
+            common = np.isfinite(observed_speed) & np.isfinite(forecast_speed)
+            observed = detect_hss_events(grid, np.where(common, observed_speed, np.nan))
+            forecast = detect_hss_events(grid, np.where(common, forecast_speed, np.nan))
+            pairs = match_hss_events(observed, forecast)
+            i, j = np.array(pairs, dtype=int).reshape(-1, 2).T
+            hits = len(pairs)
+            misses = len(observed) - hits
+            false_alarms = len(forecast) - hits
+            # Forecast minus observed timing (hours) and peak speed.
+            dt = ((forecast[HSS_TIMING].to_numpy()[j] - observed[HSS_TIMING].to_numpy()[i])
+                  / pd.Timedelta(hours=1))
+            dv = forecast["peak_speed"].to_numpy()[j] - observed["peak_speed"].to_numpy()[i]
+            rows.append({
+                "model": model_name,
                 "lead_day": lead_day,
-                "difference": (merged[f"vsw_{solver}_lagged"]
-                               - merged[f"vsw_{solver}_standard"]),
-            }))
-    divergence = pd.concat(rows, ignore_index=True).dropna() if rows else pd.DataFrame()
-    if not divergence.empty:
-        divergence = divergence.loc[divergence["lead_day"].isin(list(LEAD_DAYS))]
-        for solver, group in divergence.groupby("solver"):
-            linestyle = SOLVER_LINESTYLES[solver]
-            by_lead = group.groupby("lead_day")["difference"]
-            absolute = by_lead.apply(lambda values: values.abs().mean())
-            spread_axis.plot(absolute.index, absolute, marker="o", linestyle=linestyle,
-                             color="darkorange", label=f"mean |Δv| ({solver})")
-            bias = by_lead.mean()
-            spread_axis.plot(bias.index, bias, marker="s", linestyle=linestyle,
-                             color="gray", label=f"mean Δv ({solver})")
-        spread_axis.axhline(0, color="black", linewidth=1)
-        spread_axis.set(xlabel="Forecast lead day",
-                        ylabel="Δv = v(WSA −3 d) − v(newest WSA) [km/s]",
-                        xticks=list(LEAD_DAYS),
-                        title=f"(d) Forecast divergence ({len(common)} forecasts)")
-        spread_axis.grid(alpha=0.25)
-        spread_axis.legend(fontsize=10)
-    else:
-        spread_axis.set_visible(False)
+                "observed": len(observed),
+                "hits": hits,
+                "misses": misses,
+                "false_alarms": false_alarms,
+                "pod": ratio(hits, hits + misses),
+                "far": ratio(false_alarms, hits + false_alarms),
+                "threat_score": ratio(hits, hits + misses + false_alarms),
+                "dt_mean_hours": ratio(dt.sum(), hits),
+                "dt_mae_hours": ratio(np.abs(dt).sum(), hits),
+                "dv_peak_mean_km_s": ratio(dv.sum(), hits),
+                "dv_peak_mae_km_s": ratio(np.abs(dv).sum(), hits),
+            })
 
-    figure.suptitle("WSA-BRaVDA-SURF: newest WSA map vs map from 3 days earlier")
-    figure.tight_layout()
+    summary = pd.DataFrame(rows)
+    print(summary.to_string(index=False, float_format=lambda value: f"{value:.2f}"))
+
+    figure, axes = plt.subplots(2, 2, figsize=(16, 10), sharex=True)
+    panels = (
+        ("pod", "Probability of detection"),
+        ("far", "False alarm ratio"),
+        ("threat_score", "Threat score"),
+        ("dt_mae_hours", f"Mean absolute {HSS_TIMING} time error [hours]"),
+    )
+    for axis, (column, label) in zip(axes.ravel(), panels):
+        for model_name, group in summary.groupby("model"):
+            color, linestyle = series_style(model_name)
+            axis.plot(group["lead_day"], group[column], linestyle=linestyle,
+                      color=color, label=model_name,
+                      marker=None if model_name == RECURRENCE else "o")
+        axis.set(ylabel=label, xticks=list(LEAD_DAYS))
+        axis.grid(alpha=0.25)
+    for axis in axes[-1]:
+        axis.set_xlabel("Forecast lead day")
+    # One legend above the panels, so it never covers the curves.
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    figure.legend(handles, labels, loc="upper center", ncol=5, frameon=False)
+    legend_rows = -(-len(labels) // 5)
+    if title:
+        figure.suptitle(title, y=0.995 - 0.035 * legend_rows, fontsize=14)
+        legend_rows += 1
+    figure.tight_layout(rect=(0, 0, 1, 1 - 0.035 * legend_rows))
+    return summary
 
 
 if __name__ == "__main__":

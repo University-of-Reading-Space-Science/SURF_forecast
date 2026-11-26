@@ -1,5 +1,6 @@
 # InSitu-SURF deterministic forecast Earth time series
 # solvers: huxt, hydro
+# donki_require_linked_cme: True
 # columns: shared time/position columns, then solver-suffixed outputs (e.g. vsw_huxt, vsw_hydro)
 # forecast_issue_time_utc: 2019-09-16T00:00:00Z
 # forecast_end_time_utc: 2019-09-26T00:00:00Z
@@ -21,7 +22,6 @@
 # omni_chunk_start_utc: 2019-08-19T00:00:00Z
 # omni_chunk_end_utc: 2019-09-16T00:00:00Z
 # icme_catalogue: DONKI
-# donki_minimum_quality: 1
 # donki_assumed_icme_duration_days: 1.5
 # icme_pre_shock_buffer_days: 0.2
 # icme_post_end_buffer_days: 1

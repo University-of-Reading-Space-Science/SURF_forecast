@@ -178,7 +178,7 @@ omni_input[omni_numeric] = omni_input[omni_numeric].interpolate(
 )
 swpc_observations = omni_input.copy()
 omni_input = sinsit.removeICMEs(omni_input, icme_list='DONKI', pre_icme_buffer=0.2, 
-                                post_icme_buffer=1.0, donki_min_quality=1)
+                                post_icme_buffer=1.0)
 model = sinsit.omniSURF_forecast(forecast_time, simtime=simtime, buffertime=forecast_buffer, 
                                  rmin=rmin, rmax=rmax, dr=1.5*u.solRad, nlon=128, 
                                  v_max=3000.0*(u.km/u.s), dt_scale=4, solver=solver, 

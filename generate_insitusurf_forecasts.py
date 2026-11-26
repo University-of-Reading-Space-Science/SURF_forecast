@@ -52,7 +52,8 @@ INCLUDE_B_BOUNDARY = True
 ICME_LIST = "DONKI"
 PRE_ICME_BUFFER_DAYS = 0.2
 POST_ICME_BUFFER_DAYS = 1.0
-DONKI_MIN_QUALITY = 1
+# DONKI lists interplanetary shocks, not ICMEs; keep only shocks it links to a CME.
+DONKI_REQUIRE_LINKED_CME = True
 DONKI_CHUNK_DAYS = 60
 DONKI_ASSUMED_ICME_DURATION_DAYS = 1.5
 
@@ -76,7 +77,7 @@ def forecast_times(start, end, cadence):
     return times
 
 
-def download_donki_icmes(start, end):
+def download_donki_icmes(start, end, require_linked_cme=DONKI_REQUIRE_LINKED_CME):
     """Download a long DONKI interval as API-safe chunks, before any runs."""
     chunks = []
     chunk_start = start
@@ -88,7 +89,7 @@ def download_donki_icmes(start, end):
                 chunk_start,
                 chunk_end,
                 ICME_duration=DONKI_ASSUMED_ICME_DURATION_DAYS * u.day,
-                min_quality=DONKI_MIN_QUALITY,
+                require_linked_cme=require_linked_cme,
             )
         except KeyError as error:
             # SURF's DONKI reader currently indexes the ``location`` column
@@ -227,7 +228,10 @@ def stored_header(path):
 
 def required_header():
     """Header lines identifying files made with the current method."""
-    return [f"solvers: {', '.join(SOLVERS)}"]
+    return [
+        f"solvers: {', '.join(SOLVERS)}",
+        f"donki_require_linked_cme: {DONKI_REQUIRE_LINKED_CME}",
+    ]
 
 
 def run_one_forecast(issue_time, omni_chunk):
@@ -297,7 +301,6 @@ def run_description(issue_time, omni_chunk):
         f"omni_chunk_start_utc: {pd.Timestamp(omni_chunk['datetime'].min()):%Y-%m-%dT%H:%M:%SZ}",
         f"omni_chunk_end_utc: {pd.Timestamp(omni_chunk['datetime'].max()):%Y-%m-%dT%H:%M:%SZ}",
         f"icme_catalogue: {ICME_LIST}",
-        f"donki_minimum_quality: {DONKI_MIN_QUALITY}",
         f"donki_assumed_icme_duration_days: {DONKI_ASSUMED_ICME_DURATION_DAYS:g}",
         f"icme_pre_shock_buffer_days: {PRE_ICME_BUFFER_DAYS:g}",
         f"icme_post_end_buffer_days: {POST_ICME_BUFFER_DAYS:g}",

@@ -28,7 +28,8 @@ import surf.surf_analysis as sa
 import surf.surf_inputs as sin
 
 from generate_insitusurf_forecasts import (
-    combine_solver_series, prepare_omni, stored_header,
+    DONKI_REQUIRE_LINKED_CME, combine_solver_series, prepare_omni,
+    stored_header,
 )
 
 SIMPLE_BRAVDA = Path(__file__).resolve().parent / "simpleBRaVDA"
@@ -374,6 +375,7 @@ def required_header():
         "WSA + simpleBRaVDA + SURF deterministic forecast Earth time series",
         f"solvers: {', '.join(SOLVERS)}",
         WSA_SELECTION,
+        f"omni_donki_require_linked_cme: {DONKI_REQUIRE_LINKED_CME}",
     ]
 
 
